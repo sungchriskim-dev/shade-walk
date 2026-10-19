@@ -958,6 +958,84 @@ function coverUsability(tags,date,offsetSec){
   if(t.opening_hours){const open=isOpenAt(t.opening_hours,date,offsetSec);if(open===false)return {usable:false,mayClose:false};if(open===true)return {usable:true,mayClose:false};return {usable:true,mayClose:true};}
   return {usable:true,mayClose:!!kindMayClose};
 }
+// ---- Rain mode: cover data and scoring ----
+function coverKind(t){
+  if(t.highway==='bus_stop')return t.shelter==='yes'?'bus_shelter':null;
+  if(t.amenity==='shelter')return 'shelter';
+  if(t.public_transport==='platform'||t.railway==='platform')return (t.shelter==='yes'||/^(yes|partial)$/.test(t.covered||''))?'platform':null;
+  if(t.building==='roof'||t['building:part']==='roof')return 'roof';
+  if(/^(arcade|colonnade)$/.test(t.covered||''))return 'arcade';
+  if(t.tunnel==='building_passage')return 'passage';
+  if(t.tunnel==='yes')return 'underpass';
+  if(t.highway==='corridor'||(t.indoor&&t.indoor!=='no'))return 'indoor';
+  if(/^(yes|partial)$/.test(t.covered||''))return 'walkway';
+  return null;
+}
+function parseCover(j){
+  const cover={lines:[],areas:[],points:[]};
+  for(const e of j?.elements||[]){
+    const tags=e.tags||{},kind=coverKind(tags); if(!kind)continue; const name=tags.name||null;
+    if(e.type==='node'){cover.points.push({coord:[e.lon,e.lat],kind,name,tags});continue;}
+    const coords=(e.geometry||[]).filter(Boolean).map(g=>[g.lon,g.lat]); if(coords.length<2)continue;
+    const closed=coords.length>=4&&coords[0][0]===coords[coords.length-1][0]&&coords[0][1]===coords[coords.length-1][1];
+    if(closed&&/^(roof|platform|shelter)$/.test(kind))cover.areas.push({ring:coords,kind,name,tags});
+    else cover.lines.push({coords,kind,name,tags});
+  }
+  return cover;
+}
+// Overpass boxes [s,w,n,e] along the route, buffered 150 m; long walks are split
+// into up to 3 consecutive chunks so no single box gets large.
+function coverQueryBoxes(routes){
+  const coords=(routes||[]).flatMap(r=>r?.geometry?.coordinates||[]); if(!coords.length)return [];
+  let total=0;const cum=[0];for(let i=1;i<coords.length;i++){total+=distance(coords[i-1],coords[i]);cum.push(total);}
+  const chunks=clamp(Math.ceil(total/2200),1,3),bufLat=150/111320,bufLon=150/(111320*Math.cos(rad(coords[0][1])));
+  const boxes=[];
+  for(let c=0;c<chunks;c++){
+    const from=total*c/chunks,to=total*(c+1)/chunks;
+    const pts=coords.filter((p,i)=>cum[i]>=from-1&&cum[i]<=to+1); if(!pts.length)continue;
+    const lats=pts.map(p=>p[1]),lons=pts.map(p=>p[0]);
+    boxes.push([Math.min(...lats)-bufLat,Math.min(...lons)-bufLon,Math.max(...lats)+bufLat,Math.max(...lons)+bufLon]);
+  }
+  return boxes;
+}
+async function loadCoverForRoutes(routes){
+  const boxes=coverQueryBoxes(routes); if(!boxes.length)return null;
+  const sel=['way["covered"~"^(yes|partial|arcade|colonnade)$"]','way["tunnel"="building_passage"]','way["tunnel"="yes"]["highway"~"^(footway|path|pedestrian|steps|corridor)$"]','way["highway"="corridor"]','way["indoor"~"^(yes|corridor)$"]["highway"]','way["building"="roof"]','way["building:part"="roof"]','nwr["amenity"="shelter"]','node["highway"="bus_stop"]["shelter"="yes"]','nwr["public_transport"="platform"]["covered"~"^(yes|partial)$"]','nwr["public_transport"="platform"]["shelter"="yes"]','nwr["railway"="platform"]["covered"~"^(yes|partial)$"]','nwr["railway"="platform"]["shelter"="yes"]'];
+  const parts=boxes.flatMap(b=>sel.map(x=>`${x}(${b.map(v=>v.toFixed(5)).join(',')});`));
+  try{return parseCover(await overpassJSON(`[out:json][timeout:25];(${parts.join('')});out tags geom 2000;`,8000));}
+  catch(e){console.warn('cover data',e);return null;}
+}
+// Samples the route every ~5 m. A sample is covered within 6 m of a usable
+// covered way, inside a usable roof/platform/shelter area, or within 8 m of a
+// usable shelter point. Returns metres, %, what covered it, and covered stretches.
+function scoreCover(route,cover,date,offsetSec){
+  const coords=route?.geometry?.coordinates||[];
+  const out={coveredMeters:0,totalMeters:0,percent:0,features:[],mayClose:false,segments:[]};
+  if(coords.length<2)return out;
+  const usable=list=>(list||[]).map(f=>({f,u:coverUsability(f.tags,date,offsetSec)})).filter(x=>x.u.usable);
+  const lines=usable(cover?.lines),areas=usable(cover?.areas),points=usable(cover?.points);
+  const hit=p=>{
+    for(const x of lines){const c=x.f.coords;for(let i=1;i<c.length;i++)if(pointSegmentDistanceMeters(p,c[i-1],c[i])<=6)return x;}
+    for(const x of areas)if(pointInPolygonLngLat(p,x.f.ring))return x;
+    for(const x of points)if(distance(p,x.f.coord)<=8)return x;
+    return null;
+  };
+  const hits=new Map();let run=null;
+  for(let i=1;i<coords.length;i++){
+    const a=coords[i-1],b=coords[i],L=distance(a,b);if(!L)continue;const n=Math.max(1,Math.ceil(L/5));
+    for(let k=0;k<n;k++){
+      const at=t=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t],ds=L/n,x=hit(at((k+.5)/n));
+      out.totalMeters+=ds;
+      if(x){out.coveredMeters+=ds;hits.set(x.f,x);if(!run){run=[at(k/n)];out.segments.push(run);}run.push(at((k+1)/n));}
+      else run=null;
+    }
+  }
+  out.percent=out.totalMeters?out.coveredMeters/out.totalMeters*100:0;
+  const groups=new Map();
+  for(const {f,u} of hits.values()){if(u.mayClose)out.mayClose=true;const key=f.kind+'|'+(f.name||'');const g=groups.get(key)||{kind:f.kind,name:f.name,count:0};g.count++;groups.set(key,g);}
+  out.features=[...groups.values()];
+  return out;
+}
 async function loadRainRadar(){
   if(!map)return;
   // Only the style is needed to add a layer; waiting for every tile could stall.
@@ -2459,7 +2537,7 @@ function updateViewportInset(){if(!window.visualViewport)return;const vv=window.
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
 // Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
 const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
-if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
+if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,parseCover,scoreCover,coverQueryBoxes,loadCoverForRoutes,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
 })();
 </script>
 
