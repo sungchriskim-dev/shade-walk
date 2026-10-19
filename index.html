@@ -426,7 +426,7 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
 .rain-bars{display:flex;align-items:flex-end;gap:2px;height:30px;margin:4px 0 2px;overflow:hidden}
 .rain-bars[hidden],.rain-note[hidden],.rain-hour-label[hidden]{display:none!important}
 .rain-bars .bar{flex:1 1 0;min-width:0;border-radius:2px 2px 0 0;background:#7fb2f0;transition:height .2s,background .2s}
-.rain-bars .bar.is-dry{opacity:.25}.rain-bars .bar.is-past{opacity:.35}
+.rain-bars .bar.is-dry{opacity:.25}.rain-bars .bar.is-missing{opacity:.12}.rain-bars .bar.is-past{opacity:.35}
 .rain-bars .bar.is-selected{background:#8fc0ff;opacity:1;box-shadow:0 0 0 1px rgba(143,192,255,.6)}
 .rain-note{margin:4px 0 2px;color:#8fc0ff;font-size:10px;font-weight:700}
 .rain-hour-label{position:absolute;right:18px;top:94px;z-index:21;padding:8px 11px;border-radius:9px;background:rgba(15,19,26,.90);border:1px solid rgba(93,167,255,.22);color:#dbe8f7;font-size:11px;font-weight:700;box-shadow:var(--shadow)}
@@ -789,10 +789,10 @@ let rainBarsKey='';
 function renderRainBars(hours,selectedHour,pastBeforeHour){
   const box=$('rainBars'); if(!hours){box.hidden=true;box.innerHTML='';rainBarsKey='';return;}
   box.hidden=false;
-  const key=hours.map(h=>h.mm).join(',')+'|'+pastBeforeHour;
+  const key=hours.map(h=>h.missing?'x':h.mm).join(',')+'|'+pastBeforeHour;
   if(key!==rainBarsKey){
     rainBarsKey=key;
-    box.innerHTML=hours.map(h=>{const cls=['bar',pastBeforeHour!=null&&h.hour<pastBeforeHour?'is-past':'',h.mm<0.05?'is-dry':''].filter(Boolean).join(' ');return `<i class="${cls}" data-hour="${h.hour}" style="height:${Math.max(2,rainIntensity(h.mm).strength*28).toFixed(1)}px"></i>`;}).join('');
+    box.innerHTML=hours.map(h=>{const cls=['bar',pastBeforeHour!=null&&h.hour<pastBeforeHour?'is-past':'',h.missing?'is-missing':h.mm<0.05?'is-dry':''].filter(Boolean).join(' ');return `<i class="${cls}" data-hour="${h.hour}" style="height:${h.missing?2:Math.max(2,rainIntensity(h.mm).strength*28).toFixed(1)}px"></i>`;}).join('');
   }
   for(const el of box.children)el.classList.toggle('is-selected',Number(el.dataset.hour)===selectedHour);
 }
@@ -859,6 +859,7 @@ function syncRainZoom(){
 }
 function weatherText(code){const m={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',51:'Drizzle',53:'Drizzle',55:'Drizzle',61:'Rain',63:'Rain',65:'Heavy rain',71:'Snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'};return m[code]||'—';}
 function setWalkMode(mode){
+  routeRunSeq++;
   walkMode=mode==='rain'?'rain':'shade';
   document.body.classList.toggle('mode-rain',walkMode==='rain');
   $('shadeModeBtn').classList.toggle('active',walkMode==='shade');
@@ -920,12 +921,13 @@ function forecastAt(fc,date){
   const v=fc.hours.get(forecastKey(fc,date)); if(!v)return null;
   return {mm:v.mm,pp:v.pp,intensity:rainIntensity(v.mm)};
 }
-// One entry per device-local hour of the picked date, matching the slider;
-// null when any hour of that day has no forecast (past or beyond range).
+// One entry per device-local hour of the picked date, matching the slider. Hours
+// the forecast doesn't cover (device not on Brisbane time) come back as gaps;
+// null only when the forecast covers none of the day (past or beyond range).
 function forecastHoursForDate(fc,dateKey){
-  if(!fc)return null; const [y,m,d]=dateKey.split('-').map(Number); const out=[];
-  for(let h=0;h<24;h++){const f=forecastAt(fc,new Date(y,m-1,d,h,0));if(!f)return null;out.push({hour:h,mm:f.mm,pp:f.pp});}
-  return out;
+  if(!fc)return null; const [y,m,d]=dateKey.split('-').map(Number); const out=[]; let any=false;
+  for(let h=0;h<24;h++){const f=forecastAt(fc,new Date(y,m-1,d,h,0));if(f){any=true;out.push({hour:h,mm:f.mm,pp:f.pp});}else out.push({hour:h,mm:null,pp:null,missing:true});}
+  return any?out:null;
 }
 async function loadRainForecast(point){
   const key=`${point[0].toFixed(2)},${point[1].toFixed(2)}`;
@@ -995,11 +997,11 @@ function parseCover(j){
   return cover;
 }
 // Overpass boxes [s,w,n,e] along the route, buffered 150 m; long walks are split
-// into up to 3 consecutive chunks so no single box gets large.
+// into consecutive ~2.2 km chunks (up to 8) so no single box gets large.
 function coverQueryBoxes(routes){
   const coords=(routes||[]).flatMap(r=>r?.geometry?.coordinates||[]); if(!coords.length)return [];
   let total=0;const cum=[0];for(let i=1;i<coords.length;i++){total+=distance(coords[i-1],coords[i]);cum.push(total);}
-  const chunks=clamp(Math.ceil(total/2200),1,3),bufLat=150/111320,bufLon=150/(111320*Math.cos(rad(coords[0][1])));
+  const chunks=clamp(Math.ceil(total/2200),1,8),bufLat=150/111320,bufLon=150/(111320*Math.cos(rad(coords[0][1])));
   const boxes=[];
   for(let c=0;c<chunks;c++){
     const from=total*c/chunks,to=total*(c+1)/chunks;
@@ -1023,12 +1025,18 @@ function scoreCover(route,cover,date,offsetSec){
   const coords=route?.geometry?.coordinates||[];
   const out={coveredMeters:0,totalMeters:0,percent:0,features:[],mayClose:false,segments:[]};
   if(coords.length<2)return out;
-  const usable=list=>(list||[]).map(f=>({f,u:coverUsability(f.tags,date,offsetSec)})).filter(x=>x.u.usable);
-  const lines=usable(cover?.lines),areas=usable(cover?.areas),points=usable(cover?.points);
+  // Each feature gets a padded bounding box; samples outside it skip the exact
+  // test, and features nowhere near the route are dropped up front.
+  const dLat=m=>m/111320,dLon=m=>m/(111320*Math.cos(rad(coords[0][1])));
+  const bbox=(pts,pad)=>{let w=Infinity,s=Infinity,e=-Infinity,n=-Infinity;for(const p of pts){if(p[0]<w)w=p[0];if(p[0]>e)e=p[0];if(p[1]<s)s=p[1];if(p[1]>n)n=p[1];}return [w-dLon(pad),s-dLat(pad),e+dLon(pad),n+dLat(pad)];};
+  const inBox=(p,b)=>p[0]>=b[0]&&p[0]<=b[2]&&p[1]>=b[1]&&p[1]<=b[3];
+  const rb=bbox(coords,10),near=b=>!(b[2]<rb[0]||b[0]>rb[2]||b[3]<rb[1]||b[1]>rb[3]);
+  const usable=(list,pts,pad)=>(list||[]).map(f=>({f,b:bbox(pts(f),pad)})).filter(x=>near(x.b)).map(x=>({...x,u:coverUsability(x.f.tags,date,offsetSec)})).filter(x=>x.u.usable);
+  const lines=usable(cover?.lines,f=>f.coords,6),areas=usable(cover?.areas,f=>f.ring,0),points=usable(cover?.points,f=>[f.coord],8);
   const hit=p=>{
-    for(const x of lines){const c=x.f.coords;for(let i=1;i<c.length;i++)if(pointSegmentDistanceMeters(p,c[i-1],c[i])<=6)return x;}
-    for(const x of areas)if(pointInPolygonLngLat(p,x.f.ring))return x;
-    for(const x of points)if(distance(p,x.f.coord)<=8)return x;
+    for(const x of lines){if(!inBox(p,x.b))continue;const c=x.f.coords;for(let i=1;i<c.length;i++)if(pointSegmentDistanceMeters(p,c[i-1],c[i])<=6)return x;}
+    for(const x of areas)if(inBox(p,x.b)&&pointInPolygonLngLat(p,x.f.ring))return x;
+    for(const x of points)if(inBox(p,x.b)&&distance(p,x.f.coord)<=8)return x;
     return null;
   };
   const hits=new Map();let run=null;
@@ -2030,20 +2038,22 @@ function setRainRoutes(direct,directCover,pick,meaningful){
   currentRoutes=[{...r('shade','Dry Route',pick.data,pick.cover),same:!meaningful},r('direct','Direct Route',direct,directCover)];
   routeGeo={shade:pick.data.geometry,direct:direct.geometry};
 }
-let rainRunId=0,rainCoverStatus='checking'; // checking | ok | unavailable
+// One token for every route search in either mode: a newer search or a mode
+// switch makes any older search stop before it renders.
+let routeRunSeq=0,rainCoverStatus='checking'; // checking | ok | unavailable
 async function recalculateRain(preserveView=false){
   if(sameEndpoints())return;
-  const run=++rainRunId,stale=()=>run!==rainRunId,btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
+  const run=++routeRunSeq,stale=()=>run!==routeRunSeq||walkMode!=='rain',btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
   try{
     const o=locations.origin.coord,dest=locations.destination.coord;
     loadRainForecast([o[1],o[0]]).then(()=>{if(!stale())updateRainDisplay();});
     const cands=await buildCandidates(); if(stale())return;
     const direct=cands.find(c=>c.kind==='direct')||cands[0];
     rainCoverStatus='checking';setRainRoutes(direct.data,null,{data:direct.data,cover:null},false); selectedRoute=0; routeForecastCache=null;
-    renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
+    drawRoutes();updateRainDisplay();renderRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
     setStatus('Looking for covered walkways…');
     const cover=await loadCoverForRoutes([direct.data]); if(stale())return;
-    if(!cover){rainCoverStatus='unavailable';renderRoutes();setStatus('Cover data unavailable · showing the direct route',true);return;}
+    if(!cover){rainCoverStatus='unavailable';updateRainDisplay();renderRoutes();setStatus('Cover data unavailable · showing the direct route',true);return;}
     rainCoverStatus='ok';
     const when=selectedDate(),off=rainState.fc?.offsetSec??-when.getTimezoneOffset()*60;
     const score=data=>({data,cover:scoreCover(data,cover,when,off)});
@@ -2089,8 +2099,9 @@ async function recalculate(preserveView=false){
   if(sameEndpoints())return;
   const btn=$('recalcBtn');btn.disabled=true;setStatus('Finding the fastest walking route…');
   lastCandidates=null;
+  const run=++routeRunSeq,stale=()=>run!==routeRunSeq||walkMode!=='shade';
   try{
-    const cands=await buildCandidates();
+    const cands=await buildCandidates(); if(stale())return;
     const direct=cands.find(c=>c.kind==='direct')||cands[0];
     const alternatives=cands.filter(c=>c!==direct);
     lastCandidates={direct,alternatives};
@@ -2106,7 +2117,7 @@ async function recalculate(preserveView=false){
     if(!navigation.active&&!preserveView)fitRoutes();
     // Let MapLibre load the building tiles for the actual route viewport. This is much
     // faster than waiting for an external Overpass building request before showing cards.
-    await waitForMapIdle(1400);
+    await waitForMapIdle(1400); if(stale())return;
     hydrateShadeFromLoadedTiles();
     lastShadeCacheKey='';
     // Ensure the visual fallback and the geographic scorer see the same settled map view.
