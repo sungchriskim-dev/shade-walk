@@ -10,4 +10,4 @@ Solar-aware pedestrian routing: plan walking routes that stay in the shade, or o
 
 Built in September 2026 by Chris Kim using AI coding assistants. Single HTML file using MapLibre GL, SunCalc, OpenStreetMap (OSRM, Overpass, Nominatim), Photon, OpenFreeMap, Open-Meteo and RainViewer.
 
-Full design notes: [Shade_Walk_Documentation_v15.pdf](Shade_Walk_Documentation_v15.pdf)
+Full design notes: [Shade_Walk_Documentation_v16.pdf](Shade_Walk_Documentation_v16.pdf)
