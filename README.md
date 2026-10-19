@@ -8,6 +8,6 @@ Solar-aware pedestrian routing: plan walking routes that stay in the shade, or o
 - Rain mode: compares a Dry Route using the hourly rain forecast along the walk
 - Time slider with moving shadows, best-time-to-walk forecast, and walking navigation
 
-Built in September 2026 by Chris Kim, with Claude as coding assistant. Single HTML file using MapLibre GL, SunCalc, OpenStreetMap (OSRM, Overpass, Nominatim), Photon, OpenFreeMap, Open-Meteo and RainViewer.
+Built in September 2026 by Chris Kim using AI coding assistants. Single HTML file using MapLibre GL, SunCalc, OpenStreetMap (OSRM, Overpass, Nominatim), Photon, OpenFreeMap, Open-Meteo and RainViewer.
 
 Full design notes: [Shade_Walk_Documentation_v15.pdf](Shade_Walk_Documentation_v15.pdf)
