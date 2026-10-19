@@ -416,6 +416,9 @@ html.night-mode .night-sunrise{color:#d3bd78!important;}
 html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!important;}
 </style>
 <style>
+/* Rain mode: falling-rain canvas and darkening tint over the map */
+.rain-canvas,.rain-tint{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:3}
+.rain-canvas{display:none}.rain-tint{background:#1d3550;opacity:0;transition:opacity .4s}
 /* Rain mode: hourly bars above the slider, hour label, notes */
 .rain-bars{display:flex;align-items:flex-end;gap:2px;height:30px;margin:4px 0 2px;overflow:hidden}
 .rain-bars[hidden],.rain-note[hidden],.rain-hour-label[hidden]{display:none!important}
@@ -443,6 +446,7 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
     <button id="nightDismiss" type="button" class="night-dismiss">Continue to map</button>
   </div>
   <div id="map"></div>
+  <canvas id="rainCanvas" class="rain-canvas" aria-hidden="true"></canvas><div id="rainTint" class="rain-tint" aria-hidden="true"></div>
   <div class="map-vignette"></div>
   <aside class="sidebar">
     <section class="panel header">
@@ -777,10 +781,17 @@ let rainRadarSource=null;
 function rainTimeForDisplay(){return navigation.active?new Date():selectedDate();}
 function rainStartPoint(){const o=locations.origin.coord;if(o)return [o[1],o[0]];const c=map?.getCenter?.();return c?[c.lng,c.lat]:null;}
 function refreshRainForecast(){const p=rainStartPoint();if(!p)return;loadRainForecast(p).then(()=>updateRainDisplay());updateRainDisplay();}
+let rainBarsKey='';
+// Rebuilds the bars only when the day's data changes; slider moves just move the highlight.
 function renderRainBars(hours,selectedHour,pastBeforeHour){
-  const box=$('rainBars'); if(!hours){box.hidden=true;box.innerHTML='';return;}
+  const box=$('rainBars'); if(!hours){box.hidden=true;box.innerHTML='';rainBarsKey='';return;}
   box.hidden=false;
-  box.innerHTML=hours.map(h=>{const cls=['bar',h.hour===selectedHour?'is-selected':'',pastBeforeHour!=null&&h.hour<pastBeforeHour?'is-past':'',h.mm<0.05?'is-dry':''].filter(Boolean).join(' ');return `<i class="${cls}" data-hour="${h.hour}" style="height:${Math.max(2,rainIntensity(h.mm).strength*28).toFixed(1)}px"></i>`;}).join('');
+  const key=hours.map(h=>h.mm).join(',')+'|'+pastBeforeHour;
+  if(key!==rainBarsKey){
+    rainBarsKey=key;
+    box.innerHTML=hours.map(h=>{const cls=['bar',pastBeforeHour!=null&&h.hour<pastBeforeHour?'is-past':'',h.mm<0.05?'is-dry':''].filter(Boolean).join(' ');return `<i class="${cls}" data-hour="${h.hour}" style="height:${Math.max(2,rainIntensity(h.mm).strength*28).toFixed(1)}px"></i>`;}).join('');
+  }
+  for(const el of box.children)el.classList.toggle('is-selected',Number(el.dataset.hour)===selectedHour);
 }
 // Single refresh point for everything time-dependent in Rain mode.
 function updateRainDisplay(){
@@ -796,7 +807,49 @@ function updateRainDisplay(){
   const f=hours?forecastAt(rainState.fc,d):null;
   const label=$('rainHourLabel'); label.hidden=!f; label.textContent=f?`${formatClock(d)} · ${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`:'';
   $('altLabel').textContent=f?`${f.pp}%`:'—'; $('azLabel').textContent=f?`${f.mm.toFixed(1)} mm`:'—'; $('shadeLabel').textContent='—';
+  RainOverlay.setStrength(f?f.intensity.strength:0);
   if(currentRoutes.length)renderRoutes();
+}
+// Falling rain drawn on a canvas over the map. Drop count, streak length and
+// speed follow the forecast strength; the loop only runs while it is visible.
+const RAIN_STREET_ZOOM=12.5;
+const RainOverlay=(()=>{
+  const cv=$('rainCanvas'),tint=$('rainTint'),ctx=cv.getContext('2d');
+  const motionQuery=window.matchMedia?window.matchMedia('(prefers-reduced-motion: reduce)'):null;
+  let strength=0,raf=0,frames=0,visible=false;const drops=[];
+  const reduced=()=>!!motionQuery?.matches;
+  // Size only while shown: a hidden canvas measures 0×0.
+  function size(){const r=cv.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.round(r.width*dpr),h=Math.round(r.height*dpr);if(!w||!h||(w===cv.width&&h===cv.height))return false;for(const p of drops){p.x*=w/cv.width;p.y*=h/cv.height;}cv.width=w;cv.height=h;return true;}
+  function syncDrops(){const target=Math.round(strength*420);while(drops.length<target)drops.push({x:Math.random()*cv.width,y:Math.random()*cv.height,v:6+Math.random()*6});drops.length=target;}
+  function draw(advance){
+    const dpr=window.devicePixelRatio||1;ctx.clearRect(0,0,cv.width,cv.height);if(!drops.length)return;
+    const a=0.35+strength*0.4,dark=document.documentElement.dataset.theme==='dark';
+    ctx.strokeStyle=dark?`rgba(190,215,245,${a})`:`rgba(40,80,140,${a})`;ctx.lineWidth=1.2*dpr;ctx.beginPath();
+    const len=(8+strength*14)*dpr,sp=(1+strength*1.4)*dpr;
+    for(const p of drops){ctx.moveTo(p.x,p.y);ctx.lineTo(p.x-len*.18,p.y+len);if(advance){p.y+=p.v*sp;p.x-=p.v*sp*.18;if(p.y>cv.height){p.y=-len;p.x=Math.random()*cv.width*1.1;}}}
+    ctx.stroke();
+  }
+  const shouldRun=()=>walkMode==='rain'&&strength>0&&visible&&!reduced()&&!document.hidden;
+  function tick(){raf=0;if(!shouldRun())return;frames++;draw(true);raf=requestAnimationFrame(tick);}
+  function refresh(){
+    visible=walkMode==='rain'&&(!map||map.getZoom()>=RAIN_STREET_ZOOM);
+    cv.style.display=visible&&strength>0?'block':'none';
+    if(visible&&strength>0)size();
+    tint.style.opacity=walkMode==='rain'?(strength*0.32).toFixed(3):'0';
+    if(shouldRun()){if(!raf)raf=requestAnimationFrame(tick);return;}
+    if(raf){cancelAnimationFrame(raf);raf=0;}
+    if(visible&&strength>0)draw(false);else ctx.clearRect(0,0,cv.width,cv.height);
+  }
+  function setStrength(v){strength=walkMode==='rain'?clamp(Number(v)||0,0,1):0;syncDrops();refresh();}
+  window.addEventListener('resize',refresh);
+  document.addEventListener('visibilitychange',refresh);
+  motionQuery?.addEventListener?.('change',refresh);
+  return {setStrength,stop:()=>setStrength(0),refresh,state:()=>({running:!!raf,drops:drops.length,reduced:reduced(),visible,frames})};
+})();
+// Street level shows falling rain; suburb level and above shows the radar.
+function syncRainZoom(){
+  if(map?.getLayer('sw-rain-radar'))map.setLayoutProperty('sw-rain-radar','visibility',map.getZoom()<RAIN_STREET_ZOOM?'visible':'none');
+  RainOverlay.refresh();
 }
 function weatherText(code){const m={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',51:'Drizzle',53:'Drizzle',55:'Drizzle',61:'Rain',63:'Rain',65:'Heavy rain',71:'Snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'};return m[code]||'—';}
 function setWalkMode(mode){
@@ -826,7 +879,7 @@ function setWalkMode(mode){
   document.querySelector('.live').textContent=walkMode==='rain'?'LIVE RAIN':'LIVE SOLAR';
   updateSolarRange();
   slider.setAttribute('aria-label',walkMode==='rain'?'Walk time':'Solar time');
-  if(walkMode!=='rain'){$('rainBars').hidden=true;$('rainNote').hidden=true;$('rainHourLabel').hidden=true;}
+  if(walkMode!=='rain'){$('rainBars').hidden=true;$('rainNote').hidden=true;$('rainHourLabel').hidden=true;RainOverlay.stop();}
   if(walkMode==='rain'){ setNightMode(false); hideSolarVisuals(); loadRainRadar().catch(()=>{}); refreshRainForecast(); }
   else { removeRainRadar(); tilesDirty=true; syncSolarShadow(); onShadeDataChanged(); }
   if(routeGeo && locations.origin.coord && locations.destination.coord) recalculate(false);
@@ -876,12 +929,16 @@ async function loadRainForecast(point){
   }catch(e){console.warn('rain forecast',e);if(id===rainFetchId){rainState.fc=null;rainState.status='failed';}return null;}
 }
 async function loadRainRadar(){
-  if(!map?.loaded())return;
+  if(!map)return;
+  // Only the style is needed to add a layer; waiting for every tile could stall.
+  if(!map.isStyleLoaded())await new Promise(r=>map.once('load',r));
+  if(walkMode!=='rain')return;
   try{
     const r=await fetch('https://api.rainviewer.com/public/weather-maps.json',{cache:'no-store'});if(!r.ok)throw new Error('Radar '+r.status);const j=await r.json();const frame=j?.radar?.past?.[j.radar.past.length-1];if(!frame?.path)return;
     const tiles=`${j.host}${frame.path}/256/{z}/{x}/{y}/2/1_0.png`;
     if(!map.getSource('sw-rain-radar')) map.addSource('sw-rain-radar',{type:'raster',tiles:[tiles],tileSize:256,minzoom:0,maxzoom:7});
     if(!map.getLayer('sw-rain-radar')) map.addLayer({id:'sw-rain-radar',type:'raster',source:'sw-rain-radar',paint:{'raster-opacity':.34,'raster-fade-duration':120}},'sw-3d-buildings');
+    syncRainZoom();
     rainState.radarStamp=Date.now();
   }catch(e){console.warn('Rain radar unavailable',e);}
 }
@@ -2332,6 +2389,7 @@ map.on('sourcedata',e=>{
   clearTimeout(tileBatchTimer);
   tileBatchTimer=setTimeout(()=>{tileBatchTimer=0;if(!tilesDirty)return;tilesDirty=false;onShadeDataChanged();},Math.max(0,Math.min(200,700-(now-tileBatchStart))));
 });
+map.on('zoomend',()=>{if(walkMode==='rain')syncRainZoom();});
 map.on('idle',()=>{
   if(isNavigating)return;
   if(walkMode==='rain'){if(Date.now()-rainState.radarStamp>300000)loadRainRadar().catch(()=>{});return;}
@@ -2371,7 +2429,7 @@ function updateViewportInset(){if(!window.visualViewport)return;const vv=window.
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
 // Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
 const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
-if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate});}
+if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
 })();
 </script>
 
