@@ -824,12 +824,14 @@ const RainOverlay=(()=>{
   const reduced=()=>!!motionQuery?.matches;
   // Size only while shown: a hidden canvas measures 0×0.
   function size(){const r=cv.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=Math.round(r.width*dpr),h=Math.round(r.height*dpr);if(!w||!h||(w===cv.width&&h===cv.height))return false;for(const p of drops){p.x*=w/cv.width;p.y*=h/cv.height;}cv.width=w;cv.height=h;return true;}
-  function syncDrops(){const target=Math.round(strength*420);while(drops.length<target)drops.push({x:Math.random()*cv.width,y:Math.random()*cv.height,v:6+Math.random()*6});drops.length=target;}
+  // Any rain starts at 140 streaks so drizzle is visible; heavy rain reaches 420.
+  function syncDrops(){const target=strength>0?Math.round(140+strength*280):0;while(drops.length<target)drops.push({x:Math.random()*cv.width,y:Math.random()*cv.height,v:6+Math.random()*6});drops.length=target;}
   function draw(advance){
     const dpr=window.devicePixelRatio||1;ctx.clearRect(0,0,cv.width,cv.height);if(!drops.length)return;
-    const a=0.35+strength*0.4,dark=document.documentElement.dataset.theme==='dark';
-    ctx.strokeStyle=dark?`rgba(190,215,245,${a})`:`rgba(40,80,140,${a})`;ctx.lineWidth=1.2*dpr;ctx.beginPath();
-    const len=(8+strength*14)*dpr,sp=(1+strength*1.4)*dpr;
+    // The map stays light in both themes, so the streaks are always dark ink;
+    // light rain gets a visible floor so a little rain still reads as rain.
+    ctx.strokeStyle=`rgba(30,64,120,${(0.5+strength*0.35).toFixed(2)})`;ctx.lineWidth=(1.4+strength*0.6)*dpr;ctx.beginPath();
+    const len=(10+strength*14)*dpr,sp=(1+strength*1.4)*dpr;
     for(const p of drops){ctx.moveTo(p.x,p.y);ctx.lineTo(p.x-len*.18,p.y+len);if(advance){p.y+=p.v*sp;p.x-=p.v*sp*.18;if(p.y>cv.height){p.y=-len;p.x=Math.random()*cv.width*1.1;}}}
     ctx.stroke();
   }
@@ -881,7 +883,11 @@ function setWalkMode(mode){
     }
   }
   document.querySelector('.live').textContent=walkMode==='rain'?'LIVE RAIN':'LIVE SOLAR';
+  // Shade mode clamps the slider to daylight; at night that leaves it on sunset.
+  // Rain mode covers the whole day, so start from now unless a time was picked.
+  const atDaylightEdge=Number(slider.value)<=Number(slider.min)||Number(slider.value)>=Number(slider.max);
   updateSolarRange();
+  if(walkMode==='rain'&&atDaylightEdge&&datePicker.value===dateKeyLocal(new Date())){const n=new Date();slider.value=n.getHours()*60+n.getMinutes();}
   slider.setAttribute('aria-label',walkMode==='rain'?'Walk time':'Solar time');
   if(walkMode!=='rain'){$('rainBars').hidden=true;$('rainNote').hidden=true;$('rainHourLabel').hidden=true;RainOverlay.stop();}
   if(walkMode==='rain'){ setNightMode(false); hideSolarVisuals(); loadRainRadar().catch(()=>{}); refreshRainForecast(); }
@@ -2024,7 +2030,7 @@ function setRainRoutes(direct,directCover,pick,meaningful){
   currentRoutes=[{...r('shade','Dry Route',pick.data,pick.cover),same:!meaningful},r('direct','Direct Route',direct,directCover)];
   routeGeo={shade:pick.data.geometry,direct:direct.geometry};
 }
-let rainRunId=0;
+let rainRunId=0,rainCoverStatus='checking'; // checking | ok | unavailable
 async function recalculateRain(preserveView=false){
   if(sameEndpoints())return;
   const run=++rainRunId,stale=()=>run!==rainRunId,btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
@@ -2033,11 +2039,12 @@ async function recalculateRain(preserveView=false){
     loadRainForecast([o[1],o[0]]).then(()=>{if(!stale())updateRainDisplay();});
     const cands=await buildCandidates(); if(stale())return;
     const direct=cands.find(c=>c.kind==='direct')||cands[0];
-    setRainRoutes(direct.data,null,{data:direct.data,cover:null},false); selectedRoute=0; routeForecastCache=null;
+    rainCoverStatus='checking';setRainRoutes(direct.data,null,{data:direct.data,cover:null},false); selectedRoute=0; routeForecastCache=null;
     renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
     setStatus('Looking for covered walkways…');
     const cover=await loadCoverForRoutes([direct.data]); if(stale())return;
-    if(!cover){setStatus('Cover data unavailable · showing the direct route',true);return;}
+    if(!cover){rainCoverStatus='unavailable';renderRoutes();setStatus('Cover data unavailable · showing the direct route',true);return;}
+    rainCoverStatus='ok';
     const when=selectedDate(),off=rainState.fc?.offsetSec??-when.getTimezoneOffset()*60;
     const score=data=>({data,cover:scoreCover(data,cover,when,off)});
     const viaRoutes=await Promise.allSettled(coverViaPoints(direct.data,cover,when,off).map(v=>footRoute([o,...v.map(p=>[p[1],p[0]]),dest])));
@@ -2305,7 +2312,7 @@ function routeReason(r){
 function renderRainTripInsight(){
   const box=$('tripInsight'); if(!box)return; if(!currentRoutes.length){box.style.display='none';return;} box.style.display='block';
   const dry=currentRoutes[0],pct=dry?.cover?Math.round(dry.cover.percent):null;
-  const title=pct==null?'Checking for covered walkways…':dry.meaningful&&!dry.same?`Dry Route keeps you under cover for ${pct}% of the walk`:pct<10?'Little mapped cover on this walk':`${pct}% of this walk is under cover`;
+  const title=pct==null?(rainCoverStatus==='unavailable'?'Cover data unavailable right now':'Checking for covered walkways…'):dry.meaningful&&!dry.same?`Dry Route keeps you under cover for ${pct}% of the walk`:pct<10?'Little mapped cover on this walk':`${pct}% of this walk is under cover`;
   box.innerHTML=`<div class="trip-card"><div class="trip-icon">☂</div><div class="trip-main"><div class="trip-kicker">Trip comfort</div><div class="trip-title">${title}</div></div></div>`;
   box.onclick=null;
 }
@@ -2325,10 +2332,11 @@ function coverListText(features){
 }
 function rainCardHTML(r,direct,same,access){
   const d=rainTimeForDisplay(),f=forecastAt(rainState.fc,d),c=r.cover;
-  const badge=c?`${Math.round(c.percent)}% covered`:'Checking cover…';
+  const unknown=!c&&rainCoverStatus==='unavailable';
+  const badge=c?`${Math.round(c.percent)}% covered`:unknown?'Cover unknown':'Checking cover…';
   const extraSec=r.id==='shade'&&!same&&direct?r.duration-direct.duration:0;
   const extra=extraSec>=30?` · +${Math.max(1,Math.round(extraSec/60))} min`:'';
-  const compare=same?'No more-covered route nearby · this is the most direct way':r.id==='shade'&&direct?.cover?`${Math.round(direct.cover.percent)}% on the direct route${extra}`:r.id==='direct'?'Shortest':'';
+  const compare=unknown?"Couldn't check for cover right now":!c?'':same?'No more-covered route nearby · this is the most direct way':r.id==='shade'&&direct?.cover?`${Math.round(direct.cover.percent)}% on the direct route${extra}`:r.id==='direct'?'Shortest':'';
   const list=c?.features?.length?`<div class="cover-list">${escapeHtml(coverListText(c.features))}</div>`:'';
   const notes=c?`<div class="cover-note">Street awnings aren't in map data, so real cover may be higher.</div>${c.mayClose?'<div class="cover-note">Some arcades may close after hours</div>':''}`:'';
   return `<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span><span class="badge">${badge}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span></div>${compare?`<div class="route-reason">${compare}</div>`:''}${list}<div class="foot"><span class="rain-line">${rainLine(f,d)}</span><span>${access}</span></div>${notes}<div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
@@ -2577,7 +2585,8 @@ $('locateBtn').onclick=()=>{if(currentPosition)centerOnCurrentLocation();else us
 $('navClose').onclick=stopNavigation;$('navStop').onclick=stopNavigation;$('navRecenter').onclick=()=>{if(navigation.active)navigation.following=true;centerOnCurrentLocation();updateNavigationUI();};
 $('destinationClear').onclick=clearDestination;
 $('originClear').onclick=useCurrentLocation;datePicker.addEventListener('change',()=>{updateSolarRange();syncSolarShadow();if(walkMode==='rain')updateRainDisplay();else scheduleShadeScore();});let solarInputRaf=0;slider.addEventListener('pointerdown',()=>{sliderDragging=true;});window.addEventListener('pointerup',()=>{if(sliderDragging){sliderDragging=false;requestShadeDraw();scheduleShadeScore(120);}});$('sliderHintClose').onclick=dismissSliderHint;
-slider.addEventListener('input',()=>{if(!$('sliderHint').hidden)dismissSliderHint();if(solarInputRaf)return;solarInputRaf=requestAnimationFrame(()=>{solarInputRaf=0;syncSolarShadow();if(walkMode==='rain'){updateRainDisplay();}});});
+slider.addEventListener('input',()=>{initialSolarTimeApplied=true; // a picked time must survive the map's first load
+if(!$('sliderHint').hidden)dismissSliderHint();if(solarInputRaf)return;solarInputRaf=requestAnimationFrame(()=>{solarInputRaf=0;syncSolarShadow();if(walkMode==='rain'){updateRainDisplay();}});});
 map.on('movestart',()=>{isNavigating=true;if(navigation.active&&!navigation.programmaticMove)navigation.following=false;});
 map.on('moveend',()=>{isNavigating=false;if(walkMode!=='shade')return;if(!routeGeo)loadTrees(false);updateShadeExtent();});
 // Draw shadows as soon as building tiles arrive instead of waiting for the whole map
