@@ -2368,6 +2368,9 @@ map.on('load',async()=>{try{window.__SHADE_WALK_BUILD=SHADE_WALK_BUILD;console.i
 updateSolarRange();renderRoutes();
 function updateViewportInset(){if(!window.visualViewport)return;const vv=window.visualViewport;const obscured=Math.max(0,Math.round(window.innerHeight-(vv.height+vv.offsetTop)));document.documentElement.style.setProperty('--vv-bottom',`${obscured}px`);}
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
+// Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
+const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
+if(TEST_HOOK){TEST_HOOK.setPlace=(kind,name,coord)=>setLocation(kind,name,coord);}
 })();
 </script>
 
