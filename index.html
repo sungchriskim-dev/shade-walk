@@ -419,6 +419,9 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
 /* Rain mode: falling-rain canvas and darkening tint over the map */
 .rain-canvas,.rain-tint{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:3}
 .rain-canvas{display:none}.rain-tint{background:#1d3550;opacity:0;transition:opacity .4s}
+/* Rain mode: route card extras */
+.cover-list{margin-top:5px;font-size:10px;font-weight:700;color:#8fc0ff}.cover-note{margin-top:4px;font-size:9px;color:#8994a1}
+@media (prefers-color-scheme:light){.cover-list{color:#245da8}.cover-note{color:#5b6875}}
 /* Rain mode: hourly bars above the slider, hour label, notes */
 .rain-bars{display:flex;align-items:flex-end;gap:2px;height:30px;margin:4px 0 2px;overflow:hidden}
 .rain-bars[hidden],.rain-note[hidden],.rain-hour-label[hidden]{display:none!important}
@@ -462,7 +465,7 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
       
     </section>
     <section id="routeList" class="panel routes"><section id="tripInsight" class="trip-insight" style="display:none"></section><div id="routeCards" class="route-cards"></div></section>
-    <section class="panel legend"><span class="legend-shade"><i class="sw teal"></i>Shadiest route</span><span class="legend-rain" style="display:none"><i class="sw" style="background:#5da7ff"></i>Dry route</span><span><i class="sw blue"></i>Direct route</span><span class="legend-shade"><i class="sw sh"></i>Shade</span><span class="legend-shade"><i class="sw tree"></i>Trees</span><span class="legend-rain" style="display:none">Radar: recent rain</span></section>
+    <section class="panel legend"><span class="legend-shade"><i class="sw teal"></i>Shadiest route</span><span class="legend-rain" style="display:none"><i class="sw" style="background:#5da7ff"></i>Dry route</span><span><i class="sw blue"></i>Direct route</span><span class="legend-shade"><i class="sw sh"></i>Shade</span><span class="legend-shade"><i class="sw tree"></i>Trees</span><span class="legend-rain" style="display:none"><i class="sw" style="background:#1e40af"></i>Under cover</span><span class="legend-rain" style="display:none">Radar (zoomed out)</span></section>
     <div id="status" class="status" role="status">Loading map, buildings and solar shadow renderer…</div>
   </aside>
   <div id="rainRadarBadge" class="rain-radar-badge"><b>Rain radar</b> · recent detected rain</div>
@@ -806,7 +809,8 @@ function updateRainDisplay(){
   renderRainBars(hours,d.getHours(),dateKey===todayKey?new Date().getHours():null);
   const f=hours?forecastAt(rainState.fc,d):null;
   const label=$('rainHourLabel'); label.hidden=!f; label.textContent=f?`${formatClock(d)} · ${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`:'';
-  $('altLabel').textContent=f?`${f.pp}%`:'—'; $('azLabel').textContent=f?`${f.mm.toFixed(1)} mm`:'—'; $('shadeLabel').textContent='—';
+  $('altLabel').textContent=f?`${f.pp}%`:'—'; $('azLabel').textContent=f?`${f.mm.toFixed(1)} mm`:'—';
+  const cov=currentRoutes[0]?.cover; $('shadeLabel').textContent=cov?`${Math.round(cov.percent)}%`:'—';
   RainOverlay.setStrength(f?f.intensity.strength:0);
   if(currentRoutes.length)renderRoutes();
 }
@@ -882,6 +886,7 @@ function setWalkMode(mode){
   if(walkMode!=='rain'){$('rainBars').hidden=true;$('rainNote').hidden=true;$('rainHourLabel').hidden=true;RainOverlay.stop();}
   if(walkMode==='rain'){ setNightMode(false); hideSolarVisuals(); loadRainRadar().catch(()=>{}); refreshRainForecast(); }
   else { removeRainRadar(); tilesDirty=true; syncSolarShadow(); onShadeDataChanged(); }
+  syncRouteStyle();
   if(routeGeo && locations.origin.coord && locations.destination.coord) recalculate(false);
   else renderRoutes();
 }
@@ -1959,7 +1964,7 @@ async function prepareShadeScoring(cands,preserveView){
   let all=[];for(const c of cands) all.push(...(c.data?.geometry?.coordinates||[]));
   if(all.length>1){
     const b=all.reduce((x,p)=>x.extend(p),new maplibregl.LngLatBounds(all[0],all[0]));
-    map.fitBounds(b,{padding:{top:135,bottom:165,left:390,right:45},duration:0,maxZoom:17.3});
+    map.fitBounds(b,{padding:routeFitPadding(),duration:0,maxZoom:17.3});
     await waitForMapIdle(1100);
     await new Promise(r=>requestAnimationFrame(r));
   }
@@ -2040,7 +2045,7 @@ async function recalculateRain(preserveView=false){
     const others=[...cands.filter(c=>c!==direct).map(c=>c.data),...viaRoutes.filter(x=>x.status==='fulfilled'&&!x.value.approx).map(x=>x.value)];
     const directScore=score(direct.data),{pick,meaningful}=chooseCoverRoute(directScore,others.map(score));
     setRainRoutes(direct.data,directScore.cover,pick,meaningful);
-    renderRoutes();drawRoutes();
+    drawRoutes();updateRainDisplay();renderRoutes();
     setStatus(meaningful?`Dry Route keeps you under cover for ${Math.round(pick.cover.percent)}% of the walk`:'No more-covered route nearby · showing the direct route');
   }catch(e){if(!stale()){console.error('rain routing',e);setStatus('Walking directions are unavailable right now.',true);}}
   finally{if(!stale())btn.disabled=false;}
@@ -2299,10 +2304,34 @@ function routeReason(r){
 }
 function renderRainTripInsight(){
   const box=$('tripInsight'); if(!box)return; if(!currentRoutes.length){box.style.display='none';return;} box.style.display='block';
-  const f=forecastAt(rainState.fc,selectedDate());
-  const title=f?`${formatClock(selectedDate())} · ${f.intensity.label}`:'No rain forecast for this time';
+  const dry=currentRoutes[0],pct=dry?.cover?Math.round(dry.cover.percent):null;
+  const title=pct==null?'Checking for covered walkways…':dry.meaningful&&!dry.same?`Dry Route keeps you under cover for ${pct}% of the walk`:pct<10?'Little mapped cover on this walk':`${pct}% of this walk is under cover`;
   box.innerHTML=`<div class="trip-card"><div class="trip-icon">☂</div><div class="trip-main"><div class="trip-kicker">Trip comfort</div><div class="trip-title">${title}</div></div></div>`;
   box.onclick=null;
+}
+// ---- Rain mode: route card ----
+function rainLine(f,d){
+  if(!f)return 'No rain forecast for this time';
+  if(f.intensity.key==='dry'&&f.pp<30)return 'No rain expected at this time';
+  return `${formatClock(d)} · ${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`;
+}
+const COVER_WORDS={bus_shelter:['bus shelter','bus shelters'],shelter:['shelter','shelters'],walkway:['covered walkway','covered walkways'],arcade:['arcade','arcades'],passage:['building passage','building passages'],underpass:['underpass','underpasses'],indoor:['indoor walkway','indoor walkways'],platform:['covered platform','covered platforms'],roof:['roofed area','roofed areas']};
+// "Busway platform, King George Square arcade, 2 bus shelters": up to 3 names, then counts.
+function coverListText(features){
+  const named=[...new Set(features.filter(f=>f.name).map(f=>f.name))].slice(0,3);
+  const counts={};for(const f of features)if(!f.name)counts[f.kind]=(counts[f.kind]||0)+f.count;
+  const parts=[...named,...Object.entries(counts).map(([k,n])=>`${n} ${COVER_WORDS[k]?.[n===1?0:1]||k}`)];
+  const t=parts.join(', ');return t?t[0].toUpperCase()+t.slice(1):'';
+}
+function rainCardHTML(r,direct,same,access){
+  const d=rainTimeForDisplay(),f=forecastAt(rainState.fc,d),c=r.cover;
+  const badge=c?`${Math.round(c.percent)}% covered`:'Checking cover…';
+  const extraSec=r.id==='shade'&&!same&&direct?r.duration-direct.duration:0;
+  const extra=extraSec>=30?` · +${Math.max(1,Math.round(extraSec/60))} min`:'';
+  const compare=same?'No more-covered route nearby · this is the most direct way':r.id==='shade'&&direct?.cover?`${Math.round(direct.cover.percent)}% on the direct route${extra}`:r.id==='direct'?'Shortest':'';
+  const list=c?.features?.length?`<div class="cover-list">${escapeHtml(coverListText(c.features))}</div>`:'';
+  const notes=c?`<div class="cover-note">Street awnings aren't in map data, so real cover may be higher.</div>${c.mayClose?'<div class="cover-note">Some arcades may close after hours</div>':''}`:'';
+  return `<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span><span class="badge">${badge}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span></div>${compare?`<div class="route-reason">${compare}</div>`:''}${list}<div class="foot"><span class="rain-line">${rainLine(f,d)}</span><span>${access}</span></div>${notes}<div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
 }
 function renderTripInsight(){
   if(walkMode==='rain'){renderRainTripInsight();return;}
@@ -2378,9 +2407,7 @@ function renderRoutes(){
     el.className=`route ${r.id==='direct'?'direct ':''}${i===selectedRoute?'sel':''}`;
     const access=r.access?.bad?'⚠ May cross a private path':'';
     if(walkMode==='rain'){
-      const f=forecastAt(rainState.fc,selectedDate());
-      const line=f?`${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`:'No rain forecast for this time';
-      el.innerHTML=`<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span></div><div class="foot"><span>${line}</span><span>${access}</span></div><div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
+      el.innerHTML=rainCardHTML(r,currentRoutes.find(x=>x.id==='direct'),same,access);
     }else{
       const shaded=shadeBreakdown(r);
       el.innerHTML=`<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span><span class="badge">${Number.isFinite(r.shade)?`${Math.round(r.shade)}% Shade`:'Shade —'}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span><span>${same?'Shortest · no shadier option':r.id==='shade'?'Shadiest':'Shortest'}</span></div><div class="foot"><span>${shaded}</span><span>${access}</span></div><div class="route-reason">${routeReason(r)}</div><div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
@@ -2399,10 +2426,28 @@ function highlightSelectedRoute(){
   map.setPaintProperty('sw-shade-line','line-opacity',shadeSel?.98:.4);
   map.setPaintProperty('sw-direct-line','line-opacity',shadeSel?.5:.95);
   try{map.moveLayer(shadeSel?'sw-shade-line':'sw-direct-line','sw-nav-remaining-line');}catch(e){}
+  // Covered stretches belong to the Dry Route: keep them on top, faded when it isn't selected.
+  if(map.getLayer('sw-cover-line')){map.setPaintProperty('sw-cover-line','line-opacity',shadeSel?.95:.35);try{map.moveLayer('sw-cover-line','sw-nav-remaining-line');}catch(e){}}
 }
-function drawRoutes(){if(!routeGeo||!map.getSource('sw-direct')||!map.getSource('sw-shade'))return;highlightSelectedRoute();map.getSource('sw-direct').setData({type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:routeGeo.direct}]});map.getSource('sw-shade').setData({type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:routeGeo.shade}]});}
-function ensureRouteLayers(){if(!map.getSource('sw-direct'))map.addSource('sw-direct',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getSource('sw-shade'))map.addSource('sw-shade',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getLayer('sw-direct-line'))map.addLayer({id:'sw-direct-line',type:'line',source:'sw-direct',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#3b82f6','line-width':4.5,'line-opacity':.92}});if(!map.getLayer('sw-shade-line'))map.addLayer({id:'sw-shade-line',type:'line',source:'sw-shade',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#2dd4bf','line-width':6.5,'line-opacity':.98,'line-blur':.15}});if(!map.getSource('sw-nav-remaining'))map.addSource('sw-nav-remaining',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getLayer('sw-nav-remaining-line'))map.addLayer({id:'sw-nav-remaining-line',type:'line',source:'sw-nav-remaining',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#2dd4bf','line-width':7,'line-opacity':.92,'line-blur':.15}});}
-function fitRoutes(){if(!routeGeo)return;const all=[...routeGeo.direct.coordinates,...routeGeo.shade.coordinates],b=all.reduce((x,p)=>x.extend(p),new maplibregl.LngLatBounds(all[0],all[0]));map.fitBounds(b,{padding:{top:135,bottom:165,left:390,right:45},duration:650,maxZoom:17.3});}
+function drawRoutes(){if(!routeGeo||!map.getSource('sw-direct')||!map.getSource('sw-shade'))return;highlightSelectedRoute();syncRouteStyle();map.getSource('sw-direct').setData({type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:routeGeo.direct}]});map.getSource('sw-shade').setData({type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:routeGeo.shade}]});}
+// Rain mode draws the Dry Route light blue with its covered stretches in dark
+// blue on top; Shade mode keeps teal and no cover layer.
+function syncRouteStyle(){
+  if(!map?.getLayer('sw-shade-line'))return;
+  map.setPaintProperty('sw-shade-line','line-color',walkMode==='rain'?'#5da7ff':'#2dd4bf');
+  const segs=walkMode==='rain'&&routeGeo?(currentRoutes[0]?.cover?.segments||[]):[];
+  map.getSource('sw-cover')?.setData({type:'FeatureCollection',features:segs.map(c=>({type:'Feature',properties:{},geometry:{type:'LineString',coordinates:c}}))});
+  try{if(map.getLayer('sw-cover-line'))map.moveLayer('sw-cover-line','sw-nav-remaining-line');}catch(e){}
+}
+function ensureRouteLayers(){if(!map.getSource('sw-direct'))map.addSource('sw-direct',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getSource('sw-shade'))map.addSource('sw-shade',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getLayer('sw-direct-line'))map.addLayer({id:'sw-direct-line',type:'line',source:'sw-direct',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#3b82f6','line-width':4.5,'line-opacity':.92}});if(!map.getLayer('sw-shade-line'))map.addLayer({id:'sw-shade-line',type:'line',source:'sw-shade',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#2dd4bf','line-width':6.5,'line-opacity':.98,'line-blur':.15}});if(!map.getSource('sw-cover'))map.addSource('sw-cover',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getSource('sw-nav-remaining'))map.addSource('sw-nav-remaining',{type:'geojson',data:{type:'FeatureCollection',features:[]}});if(!map.getLayer('sw-nav-remaining-line'))map.addLayer({id:'sw-nav-remaining-line',type:'line',source:'sw-nav-remaining',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#2dd4bf','line-width':7,'line-opacity':.92,'line-blur':.15}});if(!map.getLayer('sw-cover-line'))map.addLayer({id:'sw-cover-line',type:'line',source:'sw-cover',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#1e40af','line-width':8,'line-opacity':.95}},'sw-nav-remaining-line');}
+// Room left for the panels when fitting a walk. The desktop sidebar needs 390 px
+// on the left; on a phone that would exceed the screen and fitBounds would do nothing.
+function routeFitPadding(){
+  const w=window.innerWidth,h=window.innerHeight;
+  if(w<=700&&h>w)return {top:160,bottom:Math.round(h*0.47),left:24,right:24};
+  return {top:135,bottom:165,left:Math.min(w<=900?340:390,Math.round(w*0.45)),right:45};
+}
+function fitRoutes(){if(!routeGeo)return;const all=[...routeGeo.direct.coordinates,...routeGeo.shade.coordinates],b=all.reduce((x,p)=>x.extend(p),new maplibregl.LngLatBounds(all[0],all[0]));map.fitBounds(b,{padding:routeFitPadding(),duration:650,maxZoom:17.3});}
 function flySelected(){const g=selectedRoute===0?routeGeo?.shade:routeGeo?.direct;if(!g)return;const c=g.coordinates[Math.floor(g.coordinates.length/2)];map.easeTo({center:c,zoom:16.5,duration:450});}
 function marker(text,kind){const el=document.createElement('div');el.className='marker';el.textContent=text;el.style.background=kind==='origin'?'#2dd4bf':'#3b82f6';el.style.color=kind==='origin'?'#06211d':'#fff';return el;}
 originMarker=new maplibregl.Marker({element:marker('A','origin')}).setLngLat([153.009,-27.498]).addTo(map);destinationMarker=new maplibregl.Marker({element:marker('B','destination')}).setLngLat([153.009,-27.498]).addTo(map);originMarker.getElement().style.display='none';destinationMarker.getElement().style.display='none';const locEl=document.createElement('div');locEl.className='sw-current-dot';currentLocationMarker=new maplibregl.Marker({element:locEl,anchor:'center'}).setLngLat([153.009,-27.498]).addTo(map);currentLocationMarker.getElement().style.display='none';
@@ -2588,7 +2633,7 @@ function updateViewportInset(){if(!window.visualViewport)return;const vv=window.
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
 // Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
 const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
-if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,coverViaPoints,chooseCoverRoute,routes:()=>structuredClone({routes:currentRoutes,geo:routeGeo}),mapLoaded:()=>!!map?.isStyleLoaded()&&!!map.getSource("sw-shade"),parseCover,scoreCover,coverQueryBoxes,loadCoverForRoutes,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
+if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,coverViaPoints,chooseCoverRoute,routes:()=>structuredClone({routes:currentRoutes,geo:routeGeo}),paint:(id,prop)=>map.getPaintProperty(id,prop),layerOrder:()=>map.getStyle().layers.map(l=>l.id),mapBounds:()=>map.getBounds().toArray().flat(),sourceFeatureCount:async id=>((await map.getSource(id)?.getData())?.features||[]).length,mapLoaded:()=>!!map?.isStyleLoaded()&&!!map.getSource("sw-shade"),parseCover,scoreCover,coverQueryBoxes,loadCoverForRoutes,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
 })();
 </script>
 
