@@ -1981,19 +1981,70 @@ function sameEndpoints(){
   setStatus('Your start and destination are the same place — pick a different destination.',true);
   return true;
 }
+// ---- Rain mode: Dry Route ----
+// Via points for extra walking routes through nearby usable cover: ends of
+// covered ways ≥25 m long within 250 m of the direct route (in travel order),
+// or the centre of a roof/platform/shelter area. Best (long, close) first.
+function coverViaPoints(direct,cover,date,offsetSec,max=4){
+  const rc=direct?.geometry?.coordinates||[]; if(rc.length<2||!cover)return [];
+  const cum=[0];for(let i=1;i<rc.length;i++)cum.push(cum[i-1]+distance(rc[i-1],rc[i]));
+  const nearest=p=>{let d=Infinity,at=0;for(let i=1;i<rc.length;i++){const m=pointSegmentDistanceMeters(p,rc[i-1],rc[i]);if(m<d){d=m;at=cum[i-1]+distance(rc[i-1],p);}}return {d,at};};
+  const cands=[];
+  for(const f of cover.lines||[]){
+    if(!coverUsability(f.tags,date,offsetSec).usable)continue;
+    let len=0;for(let i=1;i<f.coords.length;i++)len+=distance(f.coords[i-1],f.coords[i]); if(len<25)continue;
+    let a=f.coords[0],b=f.coords[f.coords.length-1];const na=nearest(a),nb=nearest(b),d=nearest(f.coords[Math.floor(f.coords.length/2)]).d;
+    if(d>250||(na.d<8&&nb.d<8))continue; if(na.at>nb.at)[a,b]=[b,a];
+    cands.push({via:[a,b],rank:len/(1+d/100)});
+  }
+  for(const f of cover.areas||[]){
+    if(!coverUsability(f.tags,date,offsetSec).usable)continue;
+    const ring=f.ring.slice(0,-1),c=[ring.reduce((t,p)=>t+p[0],0)/ring.length,ring.reduce((t,p)=>t+p[1],0)/ring.length],d=nearest(c).d;
+    if(d>250||d<8)continue;
+    const lons=ring.map(p=>p[0]),lats=ring.map(p=>p[1]),size=distance([Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]);
+    cands.push({via:[c],rank:size/(1+d/100)});
+  }
+  return cands.sort((x,y)=>y.rank-x.rank).slice(0,max).map(x=>x.via);
+}
+// Most cover within a 25% detour; must beat direct by ≥10 points or ≥120 m covered.
+function chooseCoverRoute(direct,cands){
+  const dd=direct.data.distance||1;let best=null,bestObj=-Infinity;
+  for(const c of cands){if(c.data.distance>dd*1.25)continue;const obj=c.cover.percent-Math.max(0,(c.data.distance-dd)/dd*100)*0.5;if(obj>bestObj){bestObj=obj;best=c;}}
+  if(!best)return {pick:direct,meaningful:false};
+  const meaningful=best.cover.percent-direct.cover.percent>=10||best.cover.coveredMeters-direct.cover.coveredMeters>=120;
+  return meaningful?{pick:best,meaningful:true}:{pick:direct,meaningful:false};
+}
+function setRainRoutes(direct,directCover,pick,meaningful){
+  const r=(id,name,x,cover)=>({id,name,distance:x.distance,duration:x.duration,steps:x.steps||[],cover,access:{bad:false,confidence:'unknown'},detour:Math.max(0,x.distance-direct.distance),meaningful:id==='direct'||meaningful});
+  currentRoutes=[{...r('shade','Dry Route',pick.data,pick.cover),same:!meaningful},r('direct','Direct Route',direct,directCover)];
+  routeGeo={shade:pick.data.geometry,direct:direct.geometry};
+}
+let rainRunId=0;
 async function recalculateRain(preserveView=false){
   if(sameEndpoints())return;
-  const btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
+  const run=++rainRunId,stale=()=>run!==rainRunId,btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
   try{
-    const cands=await buildCandidates(); const direct=cands.find(c=>c.kind==='direct')||cands[0];
-    const base={distance:direct.data.distance,duration:direct.data.duration,steps:direct.data.steps||[],access:{bad:false,confidence:'unknown'},detour:0};
-    currentRoutes=[{id:'shade',name:'Dry Route',...base,meaningful:false,same:true},{id:'direct',name:'Direct Route',...base,meaningful:true}];
-    routeGeo={shade:direct.data.geometry,direct:direct.data.geometry}; selectedRoute=0; routeForecastCache=null; renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
-    const o=locations.origin.coord; await loadRainForecast([o[1],o[0]]); updateRainDisplay(); renderRoutes(); setStatus('Showing the direct walking route');
-  }catch(e){console.error('rain routing',e);setStatus('Walking directions are unavailable right now.',true);}
-  btn.disabled=false;
+    const o=locations.origin.coord,dest=locations.destination.coord;
+    loadRainForecast([o[1],o[0]]).then(()=>{if(!stale())updateRainDisplay();});
+    const cands=await buildCandidates(); if(stale())return;
+    const direct=cands.find(c=>c.kind==='direct')||cands[0];
+    setRainRoutes(direct.data,null,{data:direct.data,cover:null},false); selectedRoute=0; routeForecastCache=null;
+    renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
+    setStatus('Looking for covered walkways…');
+    const cover=await loadCoverForRoutes([direct.data]); if(stale())return;
+    if(!cover){setStatus('Cover data unavailable · showing the direct route',true);return;}
+    const when=selectedDate(),off=rainState.fc?.offsetSec??-when.getTimezoneOffset()*60;
+    const score=data=>({data,cover:scoreCover(data,cover,when,off)});
+    const viaRoutes=await Promise.allSettled(coverViaPoints(direct.data,cover,when,off).map(v=>footRoute([o,...v.map(p=>[p[1],p[0]]),dest])));
+    if(stale())return;
+    const others=[...cands.filter(c=>c!==direct).map(c=>c.data),...viaRoutes.filter(x=>x.status==='fulfilled'&&!x.value.approx).map(x=>x.value)];
+    const directScore=score(direct.data),{pick,meaningful}=chooseCoverRoute(directScore,others.map(score));
+    setRainRoutes(direct.data,directScore.cover,pick,meaningful);
+    renderRoutes();drawRoutes();
+    setStatus(meaningful?`Dry Route keeps you under cover for ${Math.round(pick.cover.percent)}% of the walk`:'No more-covered route nearby · showing the direct route');
+  }catch(e){if(!stale()){console.error('rain routing',e);setStatus('Walking directions are unavailable right now.',true);}}
+  finally{if(!stale())btn.disabled=false;}
 }
-
 function applyShadeChoice(direct,alternatives){
   const directDetails=scoreRouteDetails(direct.data,sunInfo());
   let choice=chooseShadeRoute(direct,alternatives);
@@ -2537,7 +2588,7 @@ function updateViewportInset(){if(!window.visualViewport)return;const vv=window.
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
 // Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
 const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
-if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,parseCover,scoreCover,coverQueryBoxes,loadCoverForRoutes,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
+if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate,rainOverlayState:()=>RainOverlay.state(),setZoom:z=>map.jumpTo({zoom:z}),isOpenAt,coverUsability,coverViaPoints,chooseCoverRoute,routes:()=>structuredClone({routes:currentRoutes,geo:routeGeo}),mapLoaded:()=>!!map?.isStyleLoaded()&&!!map.getSource("sw-shade"),parseCover,scoreCover,coverQueryBoxes,loadCoverForRoutes,radarVisibility:()=>map.getLayer('sw-rain-radar')?(map.getLayoutProperty('sw-rain-radar','visibility')||'visible'):null});}
 })();
 </script>
 
