@@ -754,13 +754,13 @@ function syncSolarShadow(){
 }
 
 const weatherState={key:'',stamp:0,busy:false,nextRetry:0};
-const rainState={key:'',stamp:0,busy:false,data:new Map(),radarStamp:0};
+const rainState={fc:null,status:'idle',key:'',stamp:0,radarStamp:0};
+let rainFetchId=0;
 let rainRadarSource=null;
 function updateRainDisplay(){
   const d=selectedDate(); $('timeLabel').textContent=formatClock(d); $('sunValue').textContent='Rain mode';
-  if(!rainState.data.size){$('altLabel').textContent='—';$('azLabel').textContent='—';$('shadeLabel').textContent='—';return;}
-  const f=[...rainState.data.values()][0]?.hours||[]; if(!f.length)return; const idx=rainHourIndex(f.map(x=>x.time),d),rr=rainRiskForPoint(f[idx]); $('altLabel').textContent=`${Math.round(rr.pp)}%`; $('azLabel').textContent=`${rr.rain.toFixed(rr.rain>=1?1:2)} mm`;
-  const dry=Math.round(100-rr.risk); $('shadeLabel').textContent=`${dry}%`;
+  const f=forecastAt(rainState.fc,d);
+  $('altLabel').textContent=f?`${f.pp}%`:'—'; $('azLabel').textContent=f?`${f.mm.toFixed(1)} mm`:'—'; $('shadeLabel').textContent='—';
 }
 function weatherText(code){const m={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',51:'Drizzle',53:'Drizzle',55:'Drizzle',61:'Rain',63:'Rain',65:'Heavy rain',71:'Snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'};return m[code]||'—';}
 function setWalkMode(mode){
@@ -797,72 +797,43 @@ function setWalkMode(mode){
 function hideSolarVisuals(){
   setLayerVisible(SHADOW_LAYER,false);setLayerVisible('sw-tree-canopy',false);
 }
-function rainRiskForPoint(f){
-  const pp=Number(f?.precipitation_probability||0);
-  const rain=Number(f?.rain||0)+Number(f?.showers||0);
-  const risk=clamp(Math.max(pp,Math.min(100,rain*55)),0,100);
-  return {risk,pp,rain};
+// ---- Rain mode: forecast model ----
+// Open-Meteo hourly times are location-local without an offset, so hours are
+// keyed by shifting UTC by utc_offset_seconds, never by the device's own zone.
+function rainIntensity(mm){
+  const m=Math.max(0,Number(mm)||0);
+  const key=m<0.05?'dry':m<0.5?'drizzle':m<2.5?'light':m<7.5?'moderate':'heavy';
+  const label={dry:'Dry',drizzle:'Drizzle',light:'Light rain',moderate:'Moderate rain',heavy:'Heavy rain'}[key];
+  return {key,label,strength:Math.min(1,Math.sqrt(m/12))};
 }
-function rainHourIndex(times,date){
-  if(!times?.length)return 0;
-  const target=date.getTime();
-  let best=0,bd=Infinity;
-  for(let i=0;i<times.length;i++){const t=new Date(times[i]).getTime(),d=Math.abs(t-target);if(d<bd){bd=d;best=i;}}
-  return best;
+function parseForecast(j){
+  const h=j?.hourly; if(!h?.time?.length)return null;
+  const hours=new Map();
+  h.time.forEach((t,k)=>{const mm=Math.round(((Number(h.rain?.[k])||0)+(Number(h.showers?.[k])||0))*100)/100;hours.set(String(t).slice(0,13),{mm,pp:Number(h.precipitation_probability?.[k])||0});});
+  return {offsetSec:Number(j.utc_offset_seconds)||0,hours};
 }
-function routeSamplePoints(route,count=8){
-  const coords=route?.geometry?.coordinates||[]; if(coords.length<2)return [];
-  const out=[];
-  let total=0; const cum=[0];
-  for(let i=1;i<coords.length;i++){total+=distance(coords[i-1],coords[i]);cum.push(total);}
-  for(let k=0;k<count;k++){
-    const target=total*(k/(count-1)); let i=1; while(i<cum.length&&cum[i]<target)i++;
-    const a=coords[Math.max(0,i-1)],b=coords[Math.min(coords.length-1,i)]; const span=Math.max(1,cum[i]-cum[i-1]); const t=clamp((target-cum[i-1])/span,0,1);
-    out.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]);
-  }
+function forecastKey(fc,date){return new Date(date.getTime()+fc.offsetSec*1000).toISOString().slice(0,13);}
+function forecastAt(fc,date){
+  if(!fc||!(date instanceof Date)||isNaN(date))return null;
+  const v=fc.hours.get(forecastKey(fc,date)); if(!v)return null;
+  return {mm:v.mm,pp:v.pp,intensity:rainIntensity(v.mm)};
+}
+function forecastHoursForDate(fc,dateKey){
+  if(!fc)return null; const out=[];
+  for(let h=0;h<24;h++){const v=fc.hours.get(`${dateKey}T${pad2(h)}`);if(!v)return null;out.push({hour:h,mm:v.mm,pp:v.pp});}
   return out;
 }
-async function loadRainForecastForRoutes(routes){
-  if(!locations.origin.coord||!routes?.length)return false;
-  const points=[]; const seen=new Set();
-  for(const r of routes){for(const p of routeSamplePoints(r,8)){const k=`${p[0].toFixed(4)},${p[1].toFixed(4)}`;if(!seen.has(k)){seen.add(k);points.push(p);}}}
-  if(!points.length)return false;
-  const key=points.map(p=>`${p[1].toFixed(3)},${p[0].toFixed(3)}`).join('|')+`|${dateKeyLocal(selectedDate())}`;
-  const fresh=Date.now()-rainState.stamp<240000 && rainState.key===key && rainState.data.size;
-  if(fresh)return true;
-  if(rainState.busy)return false;
-  rainState.busy=true;rainState.key=key;
+async function loadRainForecast(point){
+  const key=`${point[0].toFixed(2)},${point[1].toFixed(2)}`;
+  if(rainState.fc&&rainState.key===key&&Date.now()-rainState.stamp<600000)return rainState.fc;
+  const id=++rainFetchId; rainState.status='loading';
   try{
-    const lats=points.map(p=>p[1].toFixed(5)).join(','),lons=points.map(p=>p[0].toFixed(5)).join(',');
-    const url=`https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain,showers,weather_code&timezone=auto&forecast_days=16`;
-    const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error('Rain forecast '+r.status);const j=await r.json();
-    const arr=Array.isArray(j)?j:[j]; rainState.data.clear();
-    arr.forEach((d,i)=>{const p=points[i];if(!p||!d?.hourly?.time)return;const hours=d.hourly.time.map((t,k)=>({time:t,precipitation_probability:d.hourly.precipitation_probability?.[k]??0,rain:d.hourly.rain?.[k]??0,showers:d.hourly.showers?.[k]??0,weather_code:d.hourly.weather_code?.[k]??0}));rainState.data.set(`${p[0].toFixed(4)},${p[1].toFixed(4)}`,{point:p,hours});});
-    rainState.stamp=Date.now();return true;
-  }finally{rainState.busy=false;}
-}
-function nearestRainSeries(p){
-  let best=null,bd=Infinity;
-  for(const v of rainState.data.values()){const d=distance(p,[v.point[0],v.point[1]]);if(d<bd){bd=d;best=v;}}
-  return best;
-}
-function scoreRainRoute(route){
-  const pts=routeSamplePoints(route,16); if(pts.length<2||!rainState.data.size)return {dataReady:false,risk:null,dryPercent:null,rainMm:0};
-  const total=route.distance||distance(pts[0],pts[pts.length-1]); const start=selectedDate(); const durationMin=Math.max(1,(route.duration||0)/60); let riskSum=0,rainMm=0,weightSum=0,peak=0;
-  for(let i=0;i<pts.length;i++){
-    const nearest=nearestRainSeries(pts[i]); if(!nearest)continue;
-    const arrMin=durationMin*(i/(pts.length-1)); const d=new Date(start.getTime()+arrMin*60000); const idx=rainHourIndex(nearest.hours.map(x=>x.time),d); const f=nearest.hours[idx], rr=rainRiskForPoint(f);
-    const w=(i===0||i===pts.length-1)?0.6:1; riskSum+=rr.risk*w; rainMm+=rr.rain*w; peak=Math.max(peak,rr.risk); weightSum+=w;
-  }
-  if(!weightSum)return {dataReady:false,risk:null,dryPercent:null,rainMm:0};
-  const risk=riskSum/weightSum; return {dataReady:true,risk,dryPercent:100-risk,rainMm:rainMm/weightSum,peakRisk:peak};
-}
-function rainRouteReason(r){
-  if(!Number.isFinite(r?.rainRisk))return 'Rain forecast unavailable';
-  if(r.rainRisk<15)return 'Mostly dry along the walk';
-  if(r.rainRisk<35)return 'Some chance of rain on the walk';
-  if(r.rainRisk<60)return 'Rain is possible along part of the route';
-  return 'Higher rain exposure on this route';
+    const url=`https://api.open-meteo.com/v1/forecast?latitude=${point[1].toFixed(4)}&longitude=${point[0].toFixed(4)}&hourly=precipitation_probability,rain,showers&timezone=auto&forecast_days=16`;
+    const r=await fetch(url,{cache:'no-store'}); if(!r.ok)throw new Error('Rain forecast '+r.status);
+    const fc=parseForecast(await r.json()); if(!fc)throw new Error('Rain forecast empty');
+    if(id===rainFetchId){rainState.fc=fc;rainState.key=key;rainState.stamp=Date.now();rainState.status='ok';}
+    return fc;
+  }catch(e){console.warn('rain forecast',e);if(id===rainFetchId){rainState.fc=null;rainState.status='failed';}return null;}
 }
 async function loadRainRadar(){
   if(!map?.loaded())return;
@@ -1807,22 +1778,14 @@ function sameEndpoints(){
 }
 async function recalculateRain(preserveView=false){
   if(sameEndpoints())return;
-  const btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a drier walking route…');
+  const btn=$('recalcBtn');btn.disabled=true;setStatus('Finding a walking route…');
   try{
-    const cands=await buildCandidates(); const direct=cands.find(c=>c.kind==='direct')||cands[0]; const alternatives=cands.filter(c=>c!==direct);
-    const routes=[direct.data,...alternatives.map(c=>c.data)]; await loadRainForecastForRoutes(routes);
-    const scored=[...routes].map((data,i)=>({data,idx:i,...scoreRainRoute(data)}));
-    const directS=scored[0];
-    const best=scored.slice(1).filter(x=>x.data.distance<=direct.data.distance*1.35).sort((a,b)=>(a.risk??100)-(b.risk??100))[0]||directS;
-    const dry=best.risk!=null&&directS.risk!=null&&best.risk+5<directS.risk?best:directS;
-    const dryData=dry.data;
-    currentRoutes=[
-      {id:'shade',name:'Dry Route',distance:dryData.distance,duration:dryData.duration,rainRisk:dry.risk,dryPercent:dry.dryPercent,rainMm:dry.rainMm,peakRisk:dry.peakRisk,steps:dryData.steps||[],desc:dry!==directS?'Lower forecast rain exposure using another pedestrian corridor':'No meaningfully drier alternative was found',access:{bad:false,confidence:'unknown'},detour:Math.max(0,dryData.distance-direct.data.distance),meaningful:dry!==directS},
-      {id:'direct',name:'Direct Route',distance:direct.data.distance,duration:direct.data.duration,rainRisk:directS.risk,dryPercent:directS.dryPercent,rainMm:directS.rainMm,peakRisk:directS.peakRisk,steps:direct.data.steps||[],desc:'Shortest practical walking route',access:{bad:false,confidence:'unknown'},detour:0,meaningful:true}
-    ];
-    currentRoutes[0].same=dry===directS;
-    routeGeo={shade:dryData.geometry,direct:direct.data.geometry}; selectedRoute=0; routeForecastCache=null; renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes(); updateRainDisplay(); await loadRainForecastForRoutes([dryData,direct.data]); renderRoutes(); setStatus(dry!==directS?'Dry route found using a different pedestrian corridor':'No lower-rain alternative found · showing direct route');
-  }catch(e){console.error('rain routing',e);setStatus('Rain forecast unavailable — showing the direct walking route.',true);}
+    const cands=await buildCandidates(); const direct=cands.find(c=>c.kind==='direct')||cands[0];
+    const base={distance:direct.data.distance,duration:direct.data.duration,steps:direct.data.steps||[],access:{bad:false,confidence:'unknown'},detour:0};
+    currentRoutes=[{id:'shade',name:'Dry Route',...base,meaningful:false,same:true},{id:'direct',name:'Direct Route',...base,meaningful:true}];
+    routeGeo={shade:direct.data.geometry,direct:direct.data.geometry}; selectedRoute=0; routeForecastCache=null; renderRoutes();drawRoutes(); if(!navigation.active&&!preserveView)fitRoutes();
+    const o=locations.origin.coord; await loadRainForecast([o[1],o[0]]); updateRainDisplay(); renderRoutes(); setStatus('Showing the direct walking route');
+  }catch(e){console.error('rain routing',e);setStatus('Walking directions are unavailable right now.',true);}
   btn.disabled=false;
 }
 
@@ -2080,12 +2043,10 @@ function routeReason(r){
 }
 function renderRainTripInsight(){
   const box=$('tripInsight'); if(!box)return; if(!currentRoutes.length){box.style.display='none';return;} box.style.display='block';
-  const dry=currentRoutes.find(r=>r.id==='shade')||currentRoutes[0], direct=currentRoutes.find(r=>r.id==='direct');
-  const has=Number.isFinite(dry?.rainRisk)&&Number.isFinite(direct?.rainRisk); const delta=has?direct.rainRisk-dry.rainRisk:0;
-  const title=!has?'Calculating rain exposure…':dry?.same?`One clear route · ${Math.round(dry.dryPercent)}% dry`:delta>=8?`Dry Route avoids more rain exposure`:delta>1?`Dry Route has less rain exposure`:'Routes have similar rain exposure';
-  const comparison=has?`Dry Route · ${Math.round(dry.dryPercent)}% dry vs ${Math.round(direct.dryPercent)}% on the direct route.`:'Rain forecast is loading along the walking corridor.';
-  box.innerHTML=`<div class="trip-card"><div class="trip-icon">☂</div><div class="trip-main"><div class="trip-kicker">Trip comfort</div><div class="trip-title">${title}</div></div><div class="trip-chevron">⌄</div></div><div class="trip-details">${comparison}</div>`;
-  box.onclick=()=>box.classList.toggle('open');
+  const f=forecastAt(rainState.fc,selectedDate());
+  const title=f?`${formatClock(selectedDate())} · ${f.intensity.label}`:'No rain forecast for this time';
+  box.innerHTML=`<div class="trip-card"><div class="trip-icon">☂</div><div class="trip-main"><div class="trip-kicker">Trip comfort</div><div class="trip-title">${title}</div></div></div>`;
+  box.onclick=null;
 }
 function renderTripInsight(){
   if(walkMode==='rain'){renderRainTripInsight();return;}
@@ -2161,9 +2122,9 @@ function renderRoutes(){
     el.className=`route ${r.id==='direct'?'direct ':''}${i===selectedRoute?'sel':''}`;
     const access=r.access?.bad?'⚠ May cross a private path':'';
     if(walkMode==='rain'){
-      const dry=Number.isFinite(r.dryPercent)?`${Math.round(r.dryPercent)}% Dry`:'Rain —';
-      const mm=Number.isFinite(r.rainMm)?`${r.rainMm.toFixed(r.rainMm>=1?1:2)} mm forecast`:'Calculating rain…';
-      el.innerHTML=`<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span><span class="badge">${dry}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span><span>${same?'Shortest · no drier option':r.id==='shade'?'Lower rain exposure':'Shortest'}</span></div><div class="foot"><span>${mm}</span><span>${access}</span></div><div class="route-reason">${rainRouteReason(r)}</div><div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
+      const f=forecastAt(rainState.fc,selectedDate());
+      const line=f?`${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`:'No rain forecast for this time';
+      el.innerHTML=`<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span></div><div class="foot"><span>${line}</span><span>${access}</span></div><div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
     }else{
       const shaded=shadeBreakdown(r);
       el.innerHTML=`<div class="rtop"><span class="dot"></span><span class="rname">${same?'Best route':r.name}</span><span class="badge">${Number.isFinite(r.shade)?`${Math.round(r.shade)}% Shade`:'Shade —'}</span></div><div class="meta"><span>${(r.distance/1000).toFixed(2)} km</span><span>${Math.max(1,Math.round(r.duration/60))} min</span><span>${same?'Shortest · no shadier option':r.id==='shade'?'Shadiest':'Shortest'}</span></div><div class="foot"><span>${shaded}</span><span>${access}</span></div><div class="route-reason">${routeReason(r)}</div><div class="route-actions"><button type="button" class="route-nav">Start navigation</button></div>`;
@@ -2370,7 +2331,7 @@ function updateViewportInset(){if(!window.visualViewport)return;const vv=window.
 updateViewportInset();if(window.visualViewport){visualViewport.addEventListener('resize',updateViewportInset,{passive:true});visualViewport.addEventListener('scroll',updateViewportInset,{passive:true});}window.addEventListener('resize',updateViewportInset,{passive:true});
 // Test-only hook: pure functions for the automated tests, exposed only with ?test=1.
 const TEST_HOOK=/[?&]test=1\b/.test(location.search)?(window.ShadeWalkTest={}):null;
-if(TEST_HOOK){TEST_HOOK.setPlace=(kind,name,coord)=>setLocation(kind,name,coord);}
+if(TEST_HOOK){Object.assign(TEST_HOOK,{setPlace:(kind,name,coord)=>setLocation(kind,name,coord),rainIntensity,parseForecast,forecastAt,forecastHoursForDate});}
 })();
 </script>
 
