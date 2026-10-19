@@ -415,6 +415,22 @@ html.night-mode .night-copy{color:#909ba8!important;}
 html.night-mode .night-sunrise{color:#d3bd78!important;}
 html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!important;}
 </style>
+<style>
+/* Rain mode: hourly bars above the slider, hour label, notes */
+.rain-bars{display:flex;align-items:flex-end;gap:2px;height:30px;margin:4px 0 2px;overflow:hidden}
+.rain-bars[hidden],.rain-note[hidden],.rain-hour-label[hidden]{display:none!important}
+.rain-bars .bar{flex:1 1 0;min-width:0;border-radius:2px 2px 0 0;background:#7fb2f0;transition:height .2s,background .2s}
+.rain-bars .bar.is-dry{opacity:.25}.rain-bars .bar.is-past{opacity:.35}
+.rain-bars .bar.is-selected{background:#8fc0ff;opacity:1;box-shadow:0 0 0 1px rgba(143,192,255,.6)}
+.rain-note{margin:4px 0 2px;color:#8fc0ff;font-size:10px;font-weight:700}
+.rain-hour-label{position:absolute;right:18px;top:94px;z-index:21;padding:8px 11px;border-radius:9px;background:rgba(15,19,26,.90);border:1px solid rgba(93,167,255,.22);color:#dbe8f7;font-size:11px;font-weight:700;box-shadow:var(--shadow)}
+@media (prefers-color-scheme:light){
+  .rain-bars .bar{background:#7fb2f0}.rain-bars .bar.is-selected{background:#1e5bd8;box-shadow:none}
+  .rain-note{color:#245da8}
+  .rain-hour-label{background:rgba(255,255,255,.94);color:#1d2a38;border-color:rgba(19,30,42,.12)}
+}
+@media(max-width:620px){.rain-hour-label{right:60px;top:52px;font-size:10px;padding:6px 9px}.rain-bars{height:22px}}
+</style>
 </head>
 <body>
 <div id="app">
@@ -446,6 +462,7 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
     <div id="status" class="status" role="status">Loading map, buildings and solar shadow renderer…</div>
   </aside>
   <div id="rainRadarBadge" class="rain-radar-badge"><b>Rain radar</b> · recent detected rain</div>
+  <div id="rainHourLabel" class="rain-hour-label" role="status" hidden></div>
   <div id="shadowBadge" class="shadow-badge"><b>Live building shadows</b> · drag the time</div>
   <div id="treeStatus" class="tree-layer-note"></div>
   <div id="navPanel" class="nav-panel" aria-live="polite">
@@ -455,7 +472,7 @@ html.night-mode .night-preview{color:#c3ccd5!important;background:#121820!import
     <div class="nav-actions"><button id="navRecenter" type="button">◎ Recenter</button><button id="navStop" type="button">End</button></div>
   </div>
   <div class="nav-pov" aria-hidden="true"><div class="nav-arrow"></div><div class="nav-hud"><span><b id="navShadeNow">—</b> shade ahead<span id="navShadeSrc"></span></span><span id="navHeading">—</span></div></div>
-  <div class="timebar"><div class="timeTop"><div><div id="timeLabel" class="time">8:30 AM</div><div class="sunphase" id="sunPhase">Sunrise <b>—</b> · Sunset <b>—</b></div></div><div class="dateTools"><input id="datePicker" type="date" aria-label="Solar date"><div class="suninfo"><span>Sun <b id="altLabel">—</b></span><span>From <b id="azLabel">—</b></span><span>Shade <b id="shadeLabel">—</b></span></div></div></div><div id="sliderHint" class="slider-hint" hidden><span>Drag to see where the shade falls at different times of day</span><button type="button" id="sliderHintClose" aria-label="Dismiss tip">×</button></div><input id="timeSlider" type="range" min="0" max="1439" step="1" value="0" aria-label="Solar time"><div class="ticks"><b id="tickMin">5 AM</b><span id="tick2">7 AM</span><span id="tick3">9 AM</span><span id="tick4">11 AM</span><span id="tick5">1 PM</span><span id="tick6">3 PM</span><span id="tick7">5 PM</span><b id="tickMax">9 PM</b></div></div>
+  <div class="timebar"><div class="timeTop"><div><div id="timeLabel" class="time">8:30 AM</div><div class="sunphase" id="sunPhase">Sunrise <b>—</b> · Sunset <b>—</b></div></div><div class="dateTools"><input id="datePicker" type="date" aria-label="Solar date"><div class="suninfo"><span>Sun <b id="altLabel">—</b></span><span>From <b id="azLabel">—</b></span><span>Shade <b id="shadeLabel">—</b></span></div></div></div><div id="sliderHint" class="slider-hint" hidden><span>Drag to see where the shade falls at different times of day</span><button type="button" id="sliderHintClose" aria-label="Dismiss tip">×</button></div><div id="rainBars" class="rain-bars" aria-hidden="true" hidden></div><input id="timeSlider" type="range" min="0" max="1439" step="1" value="0" aria-label="Solar time"><div id="rainNote" class="rain-note" hidden></div><div class="ticks"><b id="tickMin">5 AM</b><span id="tick2">7 AM</span><span id="tick3">9 AM</span><span id="tick4">11 AM</span><span id="tick5">1 PM</span><span id="tick6">3 PM</span><span id="tick7">5 PM</span><b id="tickMax">9 PM</b></div></div>
   <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
   <div class="mapcredit">© OpenStreetMap · OpenFreeMap · MapLibre · building shadows</div>
 </div>
@@ -757,10 +774,29 @@ const weatherState={key:'',stamp:0,busy:false,nextRetry:0};
 const rainState={fc:null,status:'idle',key:'',stamp:0,radarStamp:0};
 let rainFetchId=0;
 let rainRadarSource=null;
+function rainTimeForDisplay(){return navigation.active?new Date():selectedDate();}
+function rainStartPoint(){const o=locations.origin.coord;if(o)return [o[1],o[0]];const c=map?.getCenter?.();return c?[c.lng,c.lat]:null;}
+function refreshRainForecast(){const p=rainStartPoint();if(!p)return;loadRainForecast(p).then(()=>updateRainDisplay());updateRainDisplay();}
+function renderRainBars(hours,selectedHour,pastBeforeHour){
+  const box=$('rainBars'); if(!hours){box.hidden=true;box.innerHTML='';return;}
+  box.hidden=false;
+  box.innerHTML=hours.map(h=>{const cls=['bar',h.hour===selectedHour?'is-selected':'',pastBeforeHour!=null&&h.hour<pastBeforeHour?'is-past':'',h.mm<0.05?'is-dry':''].filter(Boolean).join(' ');return `<i class="${cls}" data-hour="${h.hour}" style="height:${Math.max(2,rainIntensity(h.mm).strength*28).toFixed(1)}px"></i>`;}).join('');
+}
+// Single refresh point for everything time-dependent in Rain mode.
 function updateRainDisplay(){
-  const d=selectedDate(); $('timeLabel').textContent=formatClock(d); $('sunValue').textContent='Rain mode';
-  const f=forecastAt(rainState.fc,d);
+  if(walkMode!=='rain')return;
+  const d=rainTimeForDisplay(); $('timeLabel').textContent=formatClock(d); $('sunValue').textContent='Rain mode';
+  const dateKey=dateKeyLocal(d), todayKey=dateKeyLocal(new Date());
+  const hours=forecastHoursForDate(rainState.fc,dateKey);
+  let note='';
+  if(rainState.status==='failed')note='Rain forecast unavailable';
+  else if(rainState.fc&&!hours)note=dateKey<todayKey?'No rain forecast for past dates':'No rain forecast for this date yet';
+  $('rainNote').textContent=note; $('rainNote').hidden=!note;
+  renderRainBars(hours,d.getHours(),dateKey===todayKey?new Date().getHours():null);
+  const f=hours?forecastAt(rainState.fc,d):null;
+  const label=$('rainHourLabel'); label.hidden=!f; label.textContent=f?`${formatClock(d)} · ${f.intensity.label} · ${f.mm.toFixed(1)} mm · ${f.pp}% chance`:'';
   $('altLabel').textContent=f?`${f.pp}%`:'—'; $('azLabel').textContent=f?`${f.mm.toFixed(1)} mm`:'—'; $('shadeLabel').textContent='—';
+  if(currentRoutes.length)renderRoutes();
 }
 function weatherText(code){const m={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',51:'Drizzle',53:'Drizzle',55:'Drizzle',61:'Rain',63:'Rain',65:'Heavy rain',71:'Snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'};return m[code]||'—';}
 function setWalkMode(mode){
@@ -780,7 +816,7 @@ function setWalkMode(mode){
     if(walkMode==='rain'){
       labels[0].innerHTML='Rain chance <b id="altLabel">—</b>';
       labels[1].innerHTML='Rain <b id="azLabel">—</b>';
-      labels[2].innerHTML='Dry <b id="shadeLabel">—</b>';
+      labels[2].innerHTML='Covered <b id="shadeLabel">—</b>';
     }else{
       labels[0].innerHTML='Sun <b id="altLabel">—</b>';
       labels[1].innerHTML='From <b id="azLabel">—</b>';
@@ -789,7 +825,9 @@ function setWalkMode(mode){
   }
   document.querySelector('.live').textContent=walkMode==='rain'?'LIVE RAIN':'LIVE SOLAR';
   updateSolarRange();
-  if(walkMode==='rain'){ setNightMode(false); hideSolarVisuals(); loadRainRadar().catch(()=>{}); updateRainDisplay(); }
+  slider.setAttribute('aria-label',walkMode==='rain'?'Walk time':'Solar time');
+  if(walkMode!=='rain'){$('rainBars').hidden=true;$('rainNote').hidden=true;$('rainHourLabel').hidden=true;}
+  if(walkMode==='rain'){ setNightMode(false); hideSolarVisuals(); loadRainRadar().catch(()=>{}); refreshRainForecast(); }
   else { removeRainRadar(); tilesDirty=true; syncSolarShadow(); onShadeDataChanged(); }
   if(routeGeo && locations.origin.coord && locations.destination.coord) recalculate(false);
   else renderRoutes();
@@ -818,9 +856,11 @@ function forecastAt(fc,date){
   const v=fc.hours.get(forecastKey(fc,date)); if(!v)return null;
   return {mm:v.mm,pp:v.pp,intensity:rainIntensity(v.mm)};
 }
+// One entry per device-local hour of the picked date, matching the slider;
+// null when any hour of that day has no forecast (past or beyond range).
 function forecastHoursForDate(fc,dateKey){
-  if(!fc)return null; const out=[];
-  for(let h=0;h<24;h++){const v=fc.hours.get(`${dateKey}T${pad2(h)}`);if(!v)return null;out.push({hour:h,mm:v.mm,pp:v.pp});}
+  if(!fc)return null; const [y,m,d]=dateKey.split('-').map(Number); const out=[];
+  for(let h=0;h<24;h++){const f=forecastAt(fc,new Date(y,m-1,d,h,0));if(!f)return null;out.push({hour:h,mm:f.mm,pp:f.pp});}
   return out;
 }
 async function loadRainForecast(point){
@@ -2275,7 +2315,7 @@ $('shadeModeBtn').onclick=()=>setWalkMode('shade');$('rainModeBtn').onclick=()=>
 $('locateBtn').onclick=()=>{if(currentPosition)centerOnCurrentLocation();else useCurrentLocation();};
 $('navClose').onclick=stopNavigation;$('navStop').onclick=stopNavigation;$('navRecenter').onclick=()=>{if(navigation.active)navigation.following=true;centerOnCurrentLocation();updateNavigationUI();};
 $('destinationClear').onclick=clearDestination;
-$('originClear').onclick=useCurrentLocation;datePicker.addEventListener('change',()=>{updateSolarRange();syncSolarShadow();if(walkMode==='rain'&&locations.origin.coord&&locations.destination.coord)recalculate(false);else scheduleShadeScore();});let solarInputRaf=0;slider.addEventListener('pointerdown',()=>{sliderDragging=true;});window.addEventListener('pointerup',()=>{if(sliderDragging){sliderDragging=false;requestShadeDraw();scheduleShadeScore(120);}});$('sliderHintClose').onclick=dismissSliderHint;
+$('originClear').onclick=useCurrentLocation;datePicker.addEventListener('change',()=>{updateSolarRange();syncSolarShadow();if(walkMode==='rain')updateRainDisplay();else scheduleShadeScore();});let solarInputRaf=0;slider.addEventListener('pointerdown',()=>{sliderDragging=true;});window.addEventListener('pointerup',()=>{if(sliderDragging){sliderDragging=false;requestShadeDraw();scheduleShadeScore(120);}});$('sliderHintClose').onclick=dismissSliderHint;
 slider.addEventListener('input',()=>{if(!$('sliderHint').hidden)dismissSliderHint();if(solarInputRaf)return;solarInputRaf=requestAnimationFrame(()=>{solarInputRaf=0;syncSolarShadow();if(walkMode==='rain'){updateRainDisplay();}});});
 map.on('movestart',()=>{isNavigating=true;if(navigation.active&&!navigation.programmaticMove)navigation.following=false;});
 map.on('moveend',()=>{isNavigating=false;if(walkMode!=='shade')return;if(!routeGeo)loadTrees(false);updateShadeExtent();});
@@ -2594,6 +2634,8 @@ html.night-mode .night-actions .primary-night{background:var(--teal)!important;c
   #app .nav-actions button{height:40px;font-size:13px}
   #app .nav-hud{font-size:11px!important}
   #app .tree-layer-note,#app .rain-radar-badge{display:none!important}
+  body.mode-rain #app #routeList{bottom:calc(132px + env(safe-area-inset-bottom) + var(--vv-bottom,0px))!important}
+  #app .rain-hour-label{right:auto;left:8px;top:calc(158px + env(safe-area-inset-top))}
   .navigation-active #app .timebar{display:none!important}
   .maplibregl-ctrl-bottom-right{bottom:calc(env(safe-area-inset-bottom) + var(--vv-bottom,0px))}
 }
